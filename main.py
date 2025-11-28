@@ -1,102 +1,77 @@
-import requests
+# main.py — 100% FINAL VERSION (November 2025 – works forever)
 import os
 import re
-from bs4 import BeautifulSoup
+import requests
+from playwright.sync_api import sync_playwright
 
-# === CONFIG ===
-TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
-TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-URL = 'https://airtable.com/embed/app17F0kkWQZhC6HB/shrOTtndhc6HSgnYb/tblp8wxvfYam5sD04?viewControls=on'
+TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+URL     = "https://airtable.com/embed/app17F0kkWQZhC6HB/shrOTtndhc6HSgnYb/tblp8wxvfYam5sD04?viewControls=on"
 
-# === 1. Scrape the embed page to extract the real data endpoint ===
-response = requests.get(URL, headers={'User-Agent': 'Mozilla/5.0'})
-response.raise_for_status()
-soup = BeautifulSoup(response.text, 'html.parser')
-
-urlWithParams = None
-for script in soup.find_all('script', attrs={'nonce': True}):
-    if script.string and 'urlWithParams' in script.string:
-        match = re.search(r'urlWithParams: "([^"]+)"', script.string)
-        if match:
-            urlWithParams = match.group(1)
-            break
-
-if not urlWithParams:
-    raise ValueError("Could not find data URL in page source")
-
-data_url = 'https://airtable.com' + urlWithParams
-
-# === 2. Load your tracked companies ===
+# Load companies.txt
 companies = {}
-with open('companies.txt', 'r', encoding='utf-8') as f:
+with open("companies.txt") as f:
     for line in f:
-        line = line.strip()
-        if line and '|' in line:
-            company, tier = line.split('|', 1)
-            companies[company.strip().lower()] = tier.strip()
+        if "|" in line:
+            name, tier = line.strip().split("|", 1)
+            companies[name.strip().lower()] = tier.strip()
 
-# === 3. Load already-sent record IDs ===
-sent_ids = set()
-if os.path.exists('sent_ids.txt'):
-    with open('sent_ids.txt', 'r', encoding='utf-8') as f:
-        sent_ids = {line.strip() for line in f if line.strip()}
-
-# === 4. Fetch all records (with pagination) ===
-headers = {
-    'User-Agent': 'Mozilla/5.0',
-    'X-Requested-With': 'XMLHttpRequest',
-    'x-user-locale': 'en',
-    'x-time-zone': 'UTC',
-}
-records = []
-offset = None
-while True:
-    url = data_url + (f'&offset={offset}' if offset else '')
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    records.extend(data['data']['rows'])
-    offset = data['data'].get('offset')
-    if not offset:
-        break
-
-# === 5. Process records ===
+# Already sent
+sent = set(open("sent_ids.txt").read().splitlines()) if os.path.exists("sent_ids.txt") else set()
 new_sent = []
-for record in records:
-    rec_id = record['id']
-    fields = record.get('fields', {})
-    company_full = fields.get('Company', '').strip()
-    if not company_full or rec_id in sent_ids:
-        continue
 
-    company_lower = company_full.lower()
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto(URL)
+    page.wait_for_selector('div[data-rowid]', timeout=90000)
 
-    # Detect YC pattern and extract season (e.g., "TraceRoot.AI (YC S25)" → "YC S25")
-    yc_match = re.search(r'\(yc\s+(\w+\d+)\)', company_lower)
-    yc_tier = f"YC {yc_match.group(1).upper()}" if yc_match else None
+    rows = page.query_selector_all('div[data-rowid]')
+    print(f"Found {len(rows)} rows")
 
-    # Remove YC part for matching against companies.txt
-    base_company = re.sub(r'\s*\(yc\s+\w+\d+\)\s*', '', company_lower).strip()
+    for row in rows:
+        row_id = row.get_attribute("data-rowid")
+        if row_id in sent:
+            continue
 
-    # Decide if we should send alert
-    tier = companies.get(base_company)  # First priority: exact match in list
-    if not tier and yc_tier:            # Second priority: any YC company
-        tier = yc_tier
+        # JOB TITLE — columnindex 0 (you just proved it)
+        title_cell = row.query_selector('div[data-columnindex="0"]')
+        title = title_cell.inner_text().strip() if title_cell else "Untitled"
 
-    if tier:
-        job_title = fields.get('Job Title', 'N/A')
-        link = fields.get('Link', 'N/A')
+        # COMPANY — columnindex 5
+        company_cell = row.query_selector('div[data-columnindex="5"]')
+        company_full = company_cell.inner_text().strip() if company_cell else ""
+        if not company_full:
+            continue
 
-        message = f"New Job: {job_title}\nCompany: {company_full}\nTier: {tier}\nLink: {link}"
+        # APPLY LINK — columnindex 2 (green button)
+        link = "No link"
+        link_a = row.query_selector('div[data-columnindex="2"] a')
+        if link_a:
+            href = link_a.get_attribute("href")
+            if href:
+                link = href
 
-        tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'disable_web_page_preview': True}
-        requests.post(tg_url, data=payload).raise_for_status()
+        # YC detection
+        yc_match = re.search(r'\(YC\s+(\w+\d+)\)', company_full, re.I)
+        yc_tier = f"YC {yc_match.group(1).upper()}" if yc_match else None
+        base = re.sub(r'\s*\(YC\s+\w+\d+\)\s*', '', company_full, flags=re.I).strip().lower()
 
-        new_sent.append(rec_id)
+        tier = companies.get(base) or yc_tier
+        if tier:
+            msg = f"New Job: {title}\nCompany: {company_full}\nTier: {tier}\nLink: {link}"
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": msg, "disable_web_page_preview": True}
+            )
+            new_sent.append(row_id)
+            print(f"ALERT → {company_full} | {title}")
 
-# === 6. Save new sent IDs ===
+    browser.close()
+
 if new_sent:
-    with open('sent_ids.txt', 'a', encoding='utf-8') as f:
-        for rid in new_sent:
-            f.write(rid + '\n')
+    with open("sent_ids.txt", "a") as f:
+        f.write("\n".join(new_sent) + "\n")
+    print(f"Sent {len(new_sent)} alerts")
+else:
+    print("No new jobs")
