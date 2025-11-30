@@ -2,13 +2,16 @@ name: Job Scraper
 
 on:
   schedule:
+    # Run scraper every 30 minutes
     - cron: "*/30 * * * *"
+    # Clear seen list once every day at midnight UTC
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
-  run-script:
+  scrape:
+    if: github.event.schedule == "*/30 * * * *"
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repo
         uses: actions/checkout@v3
@@ -30,3 +33,22 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py
+
+  reset-seen:
+    if: github.event.schedule == "0 0 * * *"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v3
+
+      - name: Clear sent_ids.txt
+        run: |
+          echo "" > sent_ids.txt
+
+      - name: Commit reset
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add sent_ids.txt
+          git commit -m "Clear sent list"
+          git push
